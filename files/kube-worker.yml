@@ -1,0 +1,172 @@
+#cloud-config
+
+coreos:
+
+  update:
+    group: ${update-group}
+    server: ${update-server}
+    reboot-strategy: off
+
+  fleet:
+    metadata: "${fleet-metadata}"
+    # https://github.com/coreos/flannel/issues/334
+    etcd_key_prefix: /coreos.com/fleet/
+    etcd_servers: "${etcd-endpoints}"
+    etcd_cafile: "${etcd-ca-cert-file}"
+    etcd_certfile: "${etcd-client-cert-file}"
+    etcd_keyfile: "${etcd-client-key-file}"
+
+  units:
+    - name: flanneld.service
+      command: start
+      drop-ins:
+        - name: 40-ExecStartPre-symlink.conf
+          content: |
+            [Service]
+            ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
+
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 40-flannel.conf
+          content: |
+            [Unit]
+            Requires=flanneld.service
+            After=flanneld.service
+
+    - name: fleet.service
+      command: start
+
+    - name: kubelet.service
+      enable: true
+      command: start
+      content: |
+        [Service]
+        ExecStart=/usr/bin/kubelet \
+          --api_servers=${master-endpoint} \
+          --register-node=true \
+          --allow-privileged=true \
+          --config=/etc/kubernetes/manifests \
+          --hostname-override=$private_ipv4 \
+          --cluster_dns=${dns-service-ip} \
+          --cluster_domain=cluster.local \
+          --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+          --tls-cert-file=/etc/kubernetes/ssl/worker.pem \
+          --tls-private-key-file=/etc/kubernetes/ssl/worker-key.pem \
+          --cadvisor-port=0
+        Restart=always
+        RestartSec=10
+        [Install]
+        WantedBy=multi-user.target
+
+write_files:
+  - path: "/etc/flannel/options.env"
+    permissions: "0644"
+    content: |
+      FLANNELD_IFACE=$private_ipv4
+      FLANNELD_ETCD_ENDPOINTS=${etcd-endpoints}
+      FLANNELD_ETCD_CAFILE=${etcd-ca-cert-file}
+      FLANNELD_ETCD_CERTFILE=${etcd-client-cert-file}
+      FLANNELD_ETCD_KEYFILE=${etcd-client-key-file}
+  - path: "/etc/kubernetes/ssl/ca.pem"
+    permissions: "0644"
+    encoding: "gzip+base64"
+    content: |
+      ${ca-chain-cert}
+  - path: "/etc/kubernetes/ssl/worker.pem"
+    permissions: "0644"
+    encoding: "gzip+base64"
+    content: |
+      ${worker-cert}
+  - path: "/etc/kubernetes/ssl/worker-key.pem"
+    permissions: "0644"
+    encoding: "gzip+base64"
+    content: |
+      ${worker-key}
+  - path: "${etcd-ca-cert-file}"
+    permissions: "0644"
+    encoding: "gzip+base64"
+    content: |
+      ${etcd-ca-cert}
+  - path: "${etcd-client-cert-file}"
+    permissions: "0644"
+    encoding: "gzip+base64"
+    content: |
+      ${etcd-client-cert}
+  - path: "${etcd-client-key-file}"
+    permissions: "0644"
+    encoding: "gzip+base64"
+    content: |
+      ${etcd-client-key}
+  - path: "/etc/profile.d/etcdctl.env"
+    permissions: "0644"
+    content: |
+      ETCDCTL_PEERS=${etcd-endpoints}
+      ETCDCTL_CA_FILE=${etcd-ca-cert-file}
+      ETCDCTL_CERT_FILE=${etcd-client-cert-file}
+      ETCDCTL_KEY_FILE=${etcd-client-key-file}
+  - path: "/etc/profile.d/etcdctl-config.sh"
+    permissions: "0644"
+    content: |
+      #!/bin/sh
+      export $(cat /etc/profile.d/etcdctl.env | xargs)
+      alias etcdctl="etcdctl --no-sync"
+  - path: "/etc/kubernetes/manifests/kube-proxy.yaml"
+    permissions: "0644"
+    content: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: kube-proxy
+        namespace: kube-system
+      spec:
+        hostNetwork: true
+        containers:
+        - name: kube-proxy
+          image: gcr.io/google_containers/hyperkube:v1.0.6
+          command:
+          - /hyperkube
+          - proxy
+          - --master=${master-endpoint}
+          - --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - mountPath: /etc/ssl/certs
+              name: "ssl-certs"
+            - mountPath: /etc/kubernetes/worker-kubeconfig.yaml
+              name: "kubeconfig"
+              readOnly: true
+            - mountPath: /etc/kubernetes/ssl
+              name: "etc-kube-ssl"
+              readOnly: true
+        volumes:
+          - name: "ssl-certs"
+            hostPath:
+              path: "/usr/share/ca-certificates"
+          - name: "kubeconfig"
+            hostPath:
+              path: "/etc/kubernetes/worker-kubeconfig.yaml"
+          - name: "etc-kube-ssl"
+            hostPath:
+              path: "/etc/kubernetes/ssl"
+  - path: "/etc/kubernetes/worker-kubeconfig.yaml"
+    permissions: "0644"
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - name: local
+        cluster:
+          certificate-authority: /etc/kubernetes/ssl/ca.pem
+      users:
+      - name: kubelet
+        user:
+          client-certificate: /etc/kubernetes/ssl/worker.pem
+          client-key: /etc/kubernetes/ssl/worker-key.pem
+      contexts:
+      - context:
+          cluster: local
+          user: kubelet
+        name: kubelet-context
+      current-context: kubelet-context

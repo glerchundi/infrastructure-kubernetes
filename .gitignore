@@ -1,0 +1,7 @@
+files/*
+!files/kube-master.yml
+!files/kube-worker.yml
+*.pem
+*.pub
+*.tfstate
+*.tfstate.backup
